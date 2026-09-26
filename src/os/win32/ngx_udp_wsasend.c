@@ -50,7 +50,7 @@ ngx_udp_wsasend(ngx_connection_t *c, u_char *buf, size_t size)
             }
 
         } else {
-            if (sent != size) {
+            if ((size_t) sent != size) {
                 wev->error = 1;
                 (void) ngx_connection_error(c, 0, "WSASendTo() incomplete");
                 return NGX_ERROR;
@@ -227,7 +227,7 @@ ngx_udp_overlapped_wsasend(ngx_connection_t *c, u_char *buf, size_t size)
                            "WSASendTo ovlp: fd:%d %ul of %uz",
                            c->fd, wev->available, size);
 
-            if ((u_long) size != wev->available) {
+            if (size != (size_t) wev->available) {
                 wev->error = 1;
                 (void) ngx_connection_error(c, 0, "WSASendTo() incomplete");
                 return NGX_ERROR;
@@ -250,7 +250,7 @@ ngx_udp_overlapped_wsasend(ngx_connection_t *c, u_char *buf, size_t size)
         ngx_log_debug3(NGX_LOG_DEBUG_EVENT, c->log, 0,
                        "WSASendTo: fd:%d %ul of %uz", c->fd, sent, size);
 
-        if (sent != size) {
+        if ((size_t) sent != size) {
             wev->error = 1;
             (void) ngx_connection_error(c, 0, "WSASendTo() incomplete");
             return NGX_ERROR;
