@@ -581,7 +581,7 @@ ngx_lookup_udp_connection(ngx_listening_t *ls, struct sockaddr *sockaddr,
 
 #if (NGX_WIN32)
 
-#include <ngx_udp_recv.c>
+#include "../os/win32/ngx_udp_recv.c"
 
 #else
 
