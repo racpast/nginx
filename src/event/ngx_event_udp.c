@@ -579,6 +579,9 @@ ngx_lookup_udp_connection(ngx_listening_t *ls, struct sockaddr *sockaddr,
     return NULL;
 }
 
+#endif
+
+
 #if (NGX_WIN32)
 
 #include "../os/win32/ngx_udp_recv.c"
