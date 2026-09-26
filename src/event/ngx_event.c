@@ -858,23 +858,32 @@ ngx_event_process_init(ngx_cycle_t *cycle)
         if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
             ngx_iocp_conf_t  *iocpcf;
 
-            rev->handler = ngx_event_acceptex;
+            if (ls[i].type == SOCK_DGRAM) {
+                rev->handler = ngx_event_recvmsg;
 
-            if (ngx_use_accept_mutex) {
-                continue;
-            }
+                if (ngx_add_event(rev, NGX_READ_EVENT, NGX_IOCP_IO) == NGX_ERROR) {
+                    return NGX_ERROR;
+                }
 
-            if (ngx_add_event(rev, 0, NGX_IOCP_ACCEPT) == NGX_ERROR) {
-                return NGX_ERROR;
-            }
+            } else {
+                rev->handler = ngx_event_acceptex;
 
-            ls[i].log.handler = ngx_acceptex_log_error;
+                if (ngx_use_accept_mutex) {
+                    continue;
+                }
 
-            iocpcf = ngx_event_get_conf(cycle->conf_ctx, ngx_iocp_module);
-            if (ngx_event_post_acceptex(&ls[i], iocpcf->post_acceptex)
-                == NGX_ERROR)
-            {
-                return NGX_ERROR;
+                if (ngx_add_event(rev, 0, NGX_IOCP_ACCEPT) == NGX_ERROR) {
+                    return NGX_ERROR;
+                }
+
+                ls[i].log.handler = ngx_acceptex_log_error;
+
+                iocpcf = ngx_event_get_conf(cycle->conf_ctx, ngx_iocp_module);
+                if (ngx_event_post_acceptex(&ls[i], iocpcf->post_acceptex)
+                    == NGX_ERROR)
+                {
+                    return NGX_ERROR;
+                }
             }
 
         } else {

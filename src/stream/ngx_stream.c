@@ -999,11 +999,7 @@ ngx_stream_add_listening(ngx_conf_t *cf, ngx_stream_conf_addr_t *addr)
 
     ls->addr_ntop = 1;
 
-    if (addr->opt.type == SOCK_DGRAM) {
-        ls->handler = ngx_event_recvmsg;
-    } else {
-        ls->handler = ngx_stream_init_connection;
-    }
+    ls->handler = ngx_stream_init_connection;
 
     ls->pool_size = 256;
 
