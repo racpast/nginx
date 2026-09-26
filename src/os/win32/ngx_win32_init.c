@@ -25,8 +25,8 @@ ngx_os_io_t ngx_os_io = {
     ngx_wsarecv_chain,
     ngx_udp_wsarecv,
     ngx_wsasend,
-    NULL,
-    NULL,
+    ngx_udp_wsasend,
+    ngx_udp_wsasend_chain,
     ngx_wsasend_chain,
     0
 };
@@ -49,6 +49,7 @@ LPFN_TRANSMITFILE          ngx_transmitfile;
 LPFN_TRANSMITPACKETS       ngx_transmitpackets;
 LPFN_CONNECTEX             ngx_connectex;
 LPFN_DISCONNECTEX          ngx_disconnectex;
+LPFN_WSARECVMSG            WSARecvMsg;
 
 static GUID ax_guid = WSAID_ACCEPTEX;
 static GUID as_guid = WSAID_GETACCEPTEXSOCKADDRS;
@@ -56,6 +57,7 @@ static GUID tf_guid = WSAID_TRANSMITFILE;
 static GUID tp_guid = WSAID_TRANSMITPACKETS;
 static GUID cx_guid = WSAID_CONNECTEX;
 static GUID dx_guid = WSAID_DISCONNECTEX;
+static GUID rm_guid = WSAID_WSARECVMSG;
 
 
 #if (NGX_LOAD_WSAPOLL)
@@ -228,6 +230,32 @@ ngx_os_init(ngx_log_t *log)
         ngx_log_error(NGX_LOG_ALERT, log, ngx_socket_errno,
                       ngx_close_socket_n " failed");
     }
+
+    /* get WSARecvMsg() address for UDP support */
+
+    s = ngx_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == (ngx_socket_t) -1) {
+        ngx_log_error(NGX_LOG_NOTICE, log, ngx_socket_errno,
+                      ngx_socket_n " failed");
+        goto noudp;
+    }
+
+    if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, &rm_guid, sizeof(GUID),
+                 &WSARecvMsg, sizeof(LPFN_WSARECVMSG), &bytes,
+                 NULL, NULL)
+        == -1)
+    {
+        ngx_log_error(NGX_LOG_NOTICE, log, ngx_socket_errno,
+                      "WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER, "
+                               "WSAID_WSARECVMSG) failed");
+    }
+
+    if (ngx_close_socket(s) == -1) {
+        ngx_log_error(NGX_LOG_ALERT, log, ngx_socket_errno,
+                      ngx_close_socket_n " failed");
+    }
+
+noudp:
 
 #if (NGX_LOAD_WSAPOLL)
     {

@@ -22,6 +22,8 @@
 
 #endif
 
+#endif
+
 
 struct ngx_udp_connection_s {
     ngx_rbtree_node_t   node;
@@ -55,10 +57,13 @@ ngx_int_t ngx_get_srcaddr_cmsg(struct cmsghdr *cmsg,
 #endif
 
 void ngx_event_recvmsg(ngx_event_t *ev);
+
+#if !(NGX_WIN32)
 ssize_t ngx_sendmsg(ngx_connection_t *c, struct msghdr *msg, int flags);
+#endif
+
 void ngx_udp_rbtree_insert_value(ngx_rbtree_node_t *temp,
     ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
-#endif
 
 void ngx_delete_udp_connection(void *data);
 

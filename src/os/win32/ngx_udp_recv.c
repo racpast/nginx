@@ -1,0 +1,569 @@
+
+/*
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) Nginx, Inc.
+ */
+
+
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_event.h>
+
+
+static void ngx_close_accepted_udp_connection(ngx_connection_t *c);
+static ssize_t ngx_udp_shared_recv(ngx_connection_t *c, u_char *buf,
+    size_t size);
+static ngx_int_t ngx_insert_udp_connection(ngx_connection_t *c);
+static ngx_connection_t *ngx_lookup_udp_connection(ngx_listening_t *ls,
+    struct sockaddr *sockaddr, socklen_t socklen,
+    struct sockaddr *local_sockaddr, socklen_t local_socklen);
+
+
+void
+ngx_event_recvmsg(ngx_event_t *ev)
+{
+    ssize_t            n;
+    ngx_buf_t          buf;
+    ngx_log_t         *log;
+    ngx_err_t          err;
+    socklen_t          socklen, local_socklen;
+    ngx_event_t       *rev, *wev;
+    ngx_sockaddr_t     sa, lsa;
+    struct sockaddr   *sockaddr, *local_sockaddr;
+    ngx_listening_t   *ls;
+    ngx_event_conf_t  *ecf;
+    ngx_connection_t  *c, *lc;
+    static u_char      buffer[65535];
+
+    WSABUF             wsabuf[1];
+    WSAMSG             msg;
+    u_char             msg_control[WSA_CMSG_SPACE(sizeof(struct in6_pktinfo))];
+    u_long             bytes;
+    int                rc;
+
+    if (ev->timedout) {
+        if (ngx_enable_accept_events((ngx_cycle_t *) ngx_cycle) != NGX_OK) {
+            return;
+        }
+
+        ev->timedout = 0;
+    }
+
+    ecf = ngx_event_get_conf(ngx_cycle->conf_ctx, ngx_event_core_module);
+
+    ev->available = ecf->multi_accept;
+
+    lc = ev->data;
+    ls = lc->listening;
+    ev->ready = 0;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, ev->log, 0,
+                   "recvmsg on %V, ready: %d", &ls->addr_text, ev->available);
+
+    do {
+        ngx_memzero(&msg, sizeof(WSAMSG));
+
+        wsabuf[0].buf = (char *) buffer;
+        wsabuf[0].len = sizeof(buffer);
+
+        msg.name = (struct sockaddr *) &sa;
+        msg.namelen = sizeof(ngx_sockaddr_t);
+        msg.lpBuffers = wsabuf;
+        msg.dwBufferCount = 1;
+
+        if (ls->wildcard) {
+            msg.Control.buf = (char *) msg_control;
+            msg.Control.len = sizeof(msg_control);
+
+            ngx_memzero(&msg_control, sizeof(msg_control));
+        }
+
+        bytes = 0;
+        rc = WSARecvMsg(lc->fd, &msg, &bytes, NULL, NULL);
+
+        if (rc == SOCKET_ERROR) {
+            err = ngx_socket_errno;
+
+            if (err == WSAEWOULDBLOCK) {
+                ngx_log_debug0(NGX_LOG_DEBUG_EVENT, ev->log, err,
+                               "WSARecvMsg() not ready");
+                return;
+            }
+
+            ngx_log_error(NGX_LOG_ALERT, ev->log, err, "WSARecvMsg() failed");
+
+            return;
+        }
+
+        n = bytes;
+
+        if (msg.dwFlags & (MSG_TRUNC | MSG_CTRUNC)) {
+            ngx_log_error(NGX_LOG_ALERT, ev->log, 0,
+                          "WSARecvMsg() truncated data");
+            continue;
+        }
+
+        sockaddr = msg.name;
+        socklen = msg.namelen;
+
+        if (socklen > (socklen_t) sizeof(ngx_sockaddr_t)) {
+            socklen = sizeof(ngx_sockaddr_t);
+        }
+
+        if (socklen == 0) {
+            socklen = sizeof(struct sockaddr);
+            ngx_memzero(&sa, sizeof(struct sockaddr));
+            sa.sockaddr.sa_family = ls->sockaddr->sa_family;
+        }
+
+        local_sockaddr = ls->sockaddr;
+        local_socklen = ls->socklen;
+
+        if (ls->wildcard) {
+            WSACMSGHDR  *cmsg;
+
+            ngx_memcpy(&lsa, local_sockaddr, local_socklen);
+            local_sockaddr = &lsa.sockaddr;
+
+            for (cmsg = WSA_CMSG_FIRSTHDR(&msg);
+                 cmsg != NULL;
+                 cmsg = WSA_CMSG_NXTHDR(&msg, cmsg))
+            {
+                if (cmsg->cmsg_level == IPPROTO_IP
+                    && cmsg->cmsg_type == IP_PKTINFO)
+                {
+                    struct in_pktinfo  *pkt;
+
+                    pkt = (struct in_pktinfo *) WSA_CMSG_DATA(cmsg);
+
+                    ((struct sockaddr_in *) local_sockaddr)->sin_addr =
+                                                                    pkt->ipi_addr;
+                    break;
+                }
+
+#if (NGX_HAVE_INET6)
+                if (cmsg->cmsg_level == IPPROTO_IPV6
+                    && cmsg->cmsg_type == IPV6_PKTINFO)
+                {
+                    struct in6_pktinfo  *pkt6;
+
+                    pkt6 = (struct in6_pktinfo *) WSA_CMSG_DATA(cmsg);
+
+                    ((struct sockaddr_in6 *) local_sockaddr)->sin6_addr =
+                                                                  pkt6->ipi6_addr;
+                    break;
+                }
+#endif
+            }
+        }
+
+        c = ngx_lookup_udp_connection(ls, sockaddr, socklen, local_sockaddr,
+                                      local_socklen);
+
+        if (c) {
+
+#if (NGX_DEBUG)
+            if (c->log->log_level & NGX_LOG_DEBUG_EVENT) {
+                ngx_log_handler_pt  handler;
+
+                handler = c->log->handler;
+                c->log->handler = NULL;
+
+                ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                               "recvmsg: fd:%d n:%z", c->fd, n);
+
+                c->log->handler = handler;
+            }
+#endif
+
+            ngx_memzero(&buf, sizeof(ngx_buf_t));
+
+            buf.pos = buffer;
+            buf.last = buffer + n;
+
+            rev = c->read;
+
+            c->udp->buffer = &buf;
+
+            rev->ready = 1;
+            rev->active = 0;
+
+            rev->handler(rev);
+
+            if (c->udp) {
+                c->udp->buffer = NULL;
+            }
+
+            rev->ready = 0;
+            rev->active = 1;
+
+            goto next;
+        }
+
+#if (NGX_STAT_STUB)
+        (void) ngx_atomic_fetch_add(ngx_stat_accepted, 1);
+#endif
+
+        ngx_accept_disabled = ngx_cycle->connection_n / 8
+                              - ngx_cycle->free_connection_n;
+
+        c = ngx_get_connection(lc->fd, ev->log);
+        if (c == NULL) {
+            return;
+        }
+
+        c->shared = 1;
+        c->type = SOCK_DGRAM;
+        c->socklen = socklen;
+
+#if (NGX_STAT_STUB)
+        (void) ngx_atomic_fetch_add(ngx_stat_active, 1);
+#endif
+
+        c->pool = ngx_create_pool(ls->pool_size, ev->log);
+        if (c->pool == NULL) {
+            ngx_close_accepted_udp_connection(c);
+            return;
+        }
+
+        c->sockaddr = ngx_palloc(c->pool, socklen);
+        if (c->sockaddr == NULL) {
+            ngx_close_accepted_udp_connection(c);
+            return;
+        }
+
+        ngx_memcpy(c->sockaddr, sockaddr, socklen);
+
+        log = ngx_palloc(c->pool, sizeof(ngx_log_t));
+        if (log == NULL) {
+            ngx_close_accepted_udp_connection(c);
+            return;
+        }
+
+        *log = ls->log;
+
+        c->recv = ngx_udp_shared_recv;
+        c->send = ngx_udp_send;
+        c->send_chain = ngx_udp_send_chain;
+
+        c->need_flush_buf = 1;
+
+        c->log = log;
+        c->pool->log = log;
+        c->listening = ls;
+
+        if (local_sockaddr == &lsa.sockaddr) {
+            local_sockaddr = ngx_palloc(c->pool, local_socklen);
+            if (local_sockaddr == NULL) {
+                ngx_close_accepted_udp_connection(c);
+                return;
+            }
+
+            ngx_memcpy(local_sockaddr, &lsa, local_socklen);
+        }
+
+        c->local_sockaddr = local_sockaddr;
+        c->local_socklen = local_socklen;
+
+        c->buffer = ngx_create_temp_buf(c->pool, n);
+        if (c->buffer == NULL) {
+            ngx_close_accepted_udp_connection(c);
+            return;
+        }
+
+        c->buffer->last = ngx_cpymem(c->buffer->last, buffer, n);
+
+        rev = c->read;
+        wev = c->write;
+
+        rev->active = 1;
+        wev->ready = 1;
+
+        rev->log = log;
+        wev->log = log;
+
+        /*
+         * TODO: MT: - ngx_atomic_fetch_add()
+         *             or protection by critical section or light mutex
+         *
+         * TODO: MP: - allocated in a shared memory
+         *           - ngx_atomic_fetch_add()
+         *             or protection by critical section or light mutex
+         */
+
+        c->number = ngx_atomic_fetch_add(ngx_connection_counter, 1);
+
+        c->start_time = ngx_current_msec;
+
+#if (NGX_STAT_STUB)
+        (void) ngx_atomic_fetch_add(ngx_stat_handled, 1);
+#endif
+
+        if (ls->addr_ntop) {
+            c->addr_text.data = ngx_pnalloc(c->pool, ls->addr_text_max_len);
+            if (c->addr_text.data == NULL) {
+                ngx_close_accepted_udp_connection(c);
+                return;
+            }
+
+            c->addr_text.len = ngx_sock_ntop(c->sockaddr, c->socklen,
+                                             c->addr_text.data,
+                                             ls->addr_text_max_len, 0);
+            if (c->addr_text.len == 0) {
+                ngx_close_accepted_udp_connection(c);
+                return;
+            }
+        }
+
+#if (NGX_DEBUG)
+        {
+        ngx_str_t  addr;
+        u_char     text[NGX_SOCKADDR_STRLEN];
+
+        ngx_debug_accepted_connection(ecf, c);
+
+        if (log->log_level & NGX_LOG_DEBUG_EVENT) {
+            addr.data = text;
+            addr.len = ngx_sock_ntop(c->sockaddr, c->socklen, text,
+                                     NGX_SOCKADDR_STRLEN, 1);
+
+            ngx_log_debug4(NGX_LOG_DEBUG_EVENT, log, 0,
+                           "*%uA recvmsg: %V fd:%d n:%z",
+                           c->number, &addr, c->fd, n);
+        }
+
+        }
+#endif
+
+        if (ngx_insert_udp_connection(c) != NGX_OK) {
+            ngx_close_accepted_udp_connection(c);
+            return;
+        }
+
+        log->data = NULL;
+        log->handler = NULL;
+
+        ls->handler(c);
+
+    next:
+
+        ev->available--;
+
+    } while (ev->available);
+}
+
+
+static void
+ngx_close_accepted_udp_connection(ngx_connection_t *c)
+{
+    ngx_free_connection(c);
+
+    c->fd = (ngx_socket_t) -1;
+
+    if (c->pool) {
+        ngx_destroy_pool(c->pool);
+    }
+
+#if (NGX_STAT_STUB)
+    (void) ngx_atomic_fetch_add(ngx_stat_active, -1);
+#endif
+}
+
+
+static ssize_t
+ngx_udp_shared_recv(ngx_connection_t *c, u_char *buf, size_t size)
+{
+    ssize_t     n;
+    ngx_buf_t  *b;
+
+    if (c->udp == NULL || c->udp->buffer == NULL) {
+        return NGX_AGAIN;
+    }
+
+    b = c->udp->buffer;
+
+    n = ngx_min(b->last - b->pos, (ssize_t) size);
+
+    ngx_memcpy(buf, b->pos, n);
+
+    c->udp->buffer = NULL;
+
+    c->read->ready = 0;
+    c->read->active = 1;
+
+    return n;
+}
+
+
+void
+ngx_udp_rbtree_insert_value(ngx_rbtree_node_t *temp,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
+{
+    ngx_int_t               rc;
+    ngx_connection_t       *c, *ct;
+    ngx_rbtree_node_t     **p;
+    ngx_udp_connection_t   *udp, *udpt;
+
+    for ( ;; ) {
+
+        if (node->key < temp->key) {
+
+            p = &temp->left;
+
+        } else if (node->key > temp->key) {
+
+            p = &temp->right;
+
+        } else { /* node->key == temp->key */
+
+            udp = (ngx_udp_connection_t *) node;
+            c = udp->connection;
+
+            udpt = (ngx_udp_connection_t *) temp;
+            ct = udpt->connection;
+
+            rc = ngx_memn2cmp(udp->key.data, udpt->key.data,
+                              udp->key.len, udpt->key.len);
+
+            if (rc == 0 && c->listening->wildcard) {
+                rc = ngx_cmp_sockaddr(c->local_sockaddr, c->local_socklen,
+                                      ct->local_sockaddr, ct->local_socklen, 1);
+            }
+
+            p = (rc < 0) ? &temp->left : &temp->right;
+        }
+
+        if (*p == sentinel) {
+            break;
+        }
+
+        temp = *p;
+    }
+
+    *p = node;
+    node->parent = temp;
+    node->left = sentinel;
+    node->right = sentinel;
+    ngx_rbt_red(node);
+}
+
+
+static ngx_int_t
+ngx_insert_udp_connection(ngx_connection_t *c)
+{
+    uint32_t               hash;
+    ngx_pool_cleanup_t    *cln;
+    ngx_udp_connection_t  *udp;
+
+    if (c->udp) {
+        return NGX_OK;
+    }
+
+    udp = ngx_pcalloc(c->pool, sizeof(ngx_udp_connection_t));
+    if (udp == NULL) {
+        return NGX_ERROR;
+    }
+
+    udp->connection = c;
+
+    ngx_crc32_init(hash);
+    ngx_crc32_update(&hash, (u_char *) c->sockaddr, c->socklen);
+
+    if (c->listening->wildcard) {
+        ngx_crc32_update(&hash, (u_char *) c->local_sockaddr, c->local_socklen);
+    }
+
+    ngx_crc32_final(hash);
+
+    udp->node.key = hash;
+    udp->key.data = (u_char *) c->sockaddr;
+    udp->key.len = c->socklen;
+
+    cln = ngx_pool_cleanup_add(c->pool, 0);
+    if (cln == NULL) {
+        return NGX_ERROR;
+    }
+
+    cln->data = c;
+    cln->handler = ngx_delete_udp_connection;
+
+    ngx_rbtree_insert(&c->listening->rbtree, &udp->node);
+
+    c->udp = udp;
+
+    return NGX_OK;
+}
+
+
+void
+ngx_delete_udp_connection(void *data)
+{
+    ngx_connection_t  *c = data;
+
+    if (c->udp == NULL) {
+        return;
+    }
+
+    ngx_rbtree_delete(&c->listening->rbtree, &c->udp->node);
+
+    c->udp = NULL;
+}
+
+
+static ngx_connection_t *
+ngx_lookup_udp_connection(ngx_listening_t *ls, struct sockaddr *sockaddr,
+    socklen_t socklen, struct sockaddr *local_sockaddr, socklen_t local_socklen)
+{
+    uint32_t               hash;
+    ngx_int_t              rc;
+    ngx_connection_t      *c;
+    ngx_rbtree_node_t     *node, *sentinel;
+    ngx_udp_connection_t  *udp;
+
+    node = ls->rbtree.root;
+    sentinel = ls->rbtree.sentinel;
+
+    ngx_crc32_init(hash);
+    ngx_crc32_update(&hash, (u_char *) sockaddr, socklen);
+
+    if (ls->wildcard) {
+        ngx_crc32_update(&hash, (u_char *) local_sockaddr, local_socklen);
+    }
+
+    ngx_crc32_final(hash);
+
+    while (node != sentinel) {
+
+        if (hash < node->key) {
+            node = node->left;
+            continue;
+        }
+
+        if (hash > node->key) {
+            node = node->right;
+            continue;
+        }
+
+        /* hash == node->key */
+
+        udp = (ngx_udp_connection_t *) node;
+
+        c = udp->connection;
+
+        rc = ngx_cmp_sockaddr(sockaddr, socklen,
+                              c->sockaddr, c->socklen, 1);
+
+        if (rc == 0 && ls->wildcard) {
+            rc = ngx_cmp_sockaddr(local_sockaddr, local_socklen,
+                                  c->local_sockaddr, c->local_socklen, 1);
+        }
+
+        if (rc == 0) {
+            return c;
+        }
+
+        node = (rc < 0) ? node->left : node->right;
+    }
+
+    return NULL;
+}

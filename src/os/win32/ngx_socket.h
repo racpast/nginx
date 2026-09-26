@@ -197,12 +197,29 @@ typedef BOOL (PASCAL FAR * LPFN_DISCONNECTEX) (
 #endif
 
 
+#ifndef WSAID_WSARECVMSG
+
+typedef INT (WSAAPI * LPFN_WSARECVMSG)(
+    IN SOCKET s,
+    IN OUT LPWSAMSG lpMsg,
+    OUT LPDWORD lpdwNumberOfBytesRecvd,
+    IN LPWSAOVERLAPPED lpOverlapped,
+    IN LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine
+    );
+
+#define WSAID_WSARECVMSG \
+    {0xf689d7c8,0x6f1f,0x436b,{0x8a,0x53,0xe5,0x4f,0xe3,0x51,0xc3,0x22}}
+
+#endif
+
+
 extern LPFN_ACCEPTEX              ngx_acceptex;
 extern LPFN_GETACCEPTEXSOCKADDRS  ngx_getacceptexsockaddrs;
 extern LPFN_TRANSMITFILE          ngx_transmitfile;
 extern LPFN_TRANSMITPACKETS       ngx_transmitpackets;
 extern LPFN_CONNECTEX             ngx_connectex;
 extern LPFN_DISCONNECTEX          ngx_disconnectex;
+extern LPFN_WSARECVMSG            WSARecvMsg;
 
 
 #if (NGX_HAVE_POLL && !defined POLLIN)
